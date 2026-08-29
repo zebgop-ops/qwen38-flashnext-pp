@@ -26,6 +26,10 @@ other eight apply to head unchanged. `tools/` has the validated loop
 detector and soak harnesses. `FINDINGS.md` is the full investigation log
 (19 addenda). **Do not apply `0008-WITHDRAWN-*`** — kept only as history.
 
+Benchmarks & validation: see **[RESULTS.md](RESULTS.md)** — decode/prefill
+throughput, prefix-cache hit rates and TTFT, the MTP depth sweep, the fix
+ablation, and long-context verification.
+
 License: Apache-2.0 (patches contain code derived from vLLM).
 
 ---
