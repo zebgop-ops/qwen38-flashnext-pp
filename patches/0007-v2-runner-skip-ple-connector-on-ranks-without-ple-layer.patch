@@ -1,0 +1,79 @@
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -299,6 +299,9 @@
+                 max_num_reqs=self.max_num_reqs,
+                 num_speculative_steps=self.num_speculative_steps,
+                 device=self.device,
++                # Only a speculator proposes draft tokens to relay. Diffusion LLMs
++                # also set num_speculative_steps > 0 but have no speculator.
++                relay_draft_tokens=self.speculative_config is not None,
+             )
+ 
+         # Samplers and decode_query_len created in load_model() after
+@@ -356,6 +359,20 @@
+ 
+     def _setup_ple_offload(self, ipc_addr: str) -> None:
+         """Initialize PLE offload after the model state is available."""
++        # Under PP only the rank owning the PLE layers needs a connector. Other
++        # ranks hold no PleOffloadLayer, and building a connector there both
++        # raises ("model has no PleOffloadLayer") and sends a spurious
++        # registration -- the offload worker waits for exactly
++        # dp_size * tp_size of them (GPUWorker.spawn_ple_offload).
++        from vllm.model_executor.layers.ple_offload_layer import PleOffloadLayer
++
++        if not any(
++            isinstance(m, PleOffloadLayer) for _, m in self.model.named_modules()
++        ):
++            logger.info(
++                "No PleOffloadLayer on this rank; skipping PLE offload connector."
++            )
++            return
+         # PLE placeholders are created by model loading, so CUDA output
+         # registration cannot happen in the runner constructor.
+         query_start_loc_source = getattr(self.model_state, "ple_query_start_loc", None)
+@@ -997,7 +1014,18 @@
+         if self.pp_handler is not None:
+             outputs = self.pp_handler.get_prev_sampled_outputs()
+             if outputs is not None:
++                # Spec decode: scatter the relayed proposed draft tokens into this
++                # rank's state so the next step's combine_sampled_and_draft_tokens
++                # reads real values. Pop before postprocess_sampled (which does not
++                # accept this kwarg). idx_mapping has -1 for excluded/freed reqs.
++                draft_tokens = outputs.pop("draft_tokens", None)
++                idx_mapping = outputs["idx_mapping"]
+                 self.postprocess_sampled(**outputs)
++                if draft_tokens is not None:
++                    valid = idx_mapping >= 0
++                    self.req_states.draft_tokens[idx_mapping[valid]] = draft_tokens[
++                        valid
++                    ]
+ 
+     def add_requests(self, scheduler_output: SchedulerOutput) -> None:
+         for new_req_data in scheduler_output.scheduled_new_reqs:
+@@ -1855,7 +1883,13 @@
+         )
+ 
+         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
+-        if self.speculator is not None and self.speculator.supports_mm_inputs:
++        # The encoder runner exists only on the first PP rank, so later ranks
++        # have no cached embeddings to gather.
++        if (
++            self.speculator is not None
++            and self.speculator.supports_mm_inputs
++            and self.model_state.supports_mm_inputs
++        ):
+             # Get cached multimodal embeddings for draft forward.
+             # NOTE: This is done here because postprocess updates
+             # num_computed_prefill_tokens.
+@@ -1905,6 +1939,11 @@
+                     mm_inputs=mm_inputs,
+                 )
+             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
++            if self.pp_handler is not None:
++                # Relay the proposed draft tokens to non-last PP ranks so their
++                # next-step combine_sampled_and_draft_tokens reads real values
++                # instead of zero-init (otherwise spec acceptance ~= 0 / garbage).
++                self.pp_handler.broadcast_draft(draft_tokens, input_batch)
+             if self.adaptive_verification is not None:
+                 self.adaptive_verification.record_confidences(
+                     self.speculator.draft_token_confidence_probs, input_batch

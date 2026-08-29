@@ -1,0 +1,59 @@
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -107,6 +107,39 @@
+     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+ 
+ 
++def _ple_confined_to_first_pp_rank(vllm_config) -> bool:
++    """True when every PLE n-gram layer lives on the first pipeline rank.
++
++    PLE needs raw input_ids, which only rank 0 receives, and the offload worker
++    is spawned from rank 0 (see spawn_ple_offload). Both facts line up when the
++    PLE layers sit on rank 0. Given the n-gram table is ~50 GiB in a single
++    layer, a memory-balanced partition puts it there anyway.
++    """
++    import os
++    cfg = vllm_config.model_config.hf_text_config
++    ple = tuple(getattr(cfg, "ple_layer_ids", ()) or ())
++    if not ple:
++        return True
++    pp = vllm_config.parallel_config.pipeline_parallel_size
++    if pp <= 1:
++        return True
++    n = int(cfg.num_hidden_layers)
++    spec = os.getenv("VLLM_PP_LAYER_PARTITION", "")
++    if spec:
++        try:
++            parts = [int(x) for x in spec.split(",")]
++        except ValueError:
++            return False
++        if len(parts) != pp or sum(parts) != n:
++            return False
++        first_end = parts[0]
++    else:
++        first_end = n // pp
++    # ple_layer_ids are 1-based vs vLLM's 0-based layer index: the model
++    # attaches PLE where "(self.layer_idx + 1) in ple_layer_ids".
++    return all(0 <= int(i) - 1 < first_end for i in ple)
++
++
+ class AsyncIntermediateTensors(IntermediateTensors):
+     """IntermediateTensors with lazy comm synchronization"""
+ 
+@@ -226,8 +259,14 @@
+                 f"({parallel_config.data_parallel_size_local}/"
+                 f"{parallel_config.data_parallel_size} local ranks)"
+             )
+-        if parallel_config.pipeline_parallel_size != 1:
+-            unsupported.append(f"PP={parallel_config.pipeline_parallel_size}")
++        if parallel_config.pipeline_parallel_size != 1 and not (
++            _ple_confined_to_first_pp_rank(self.vllm_config)
++        ):
++            unsupported.append(
++                f"PP={parallel_config.pipeline_parallel_size} "
++                "(PLE layers not confined to rank 0; pin "
++                "VLLM_PP_LAYER_PARTITION so they are)"
++            )
+         if parallel_config.prefill_context_parallel_size != 1:
+             unsupported.append(f"PCP={parallel_config.prefill_context_parallel_size}")
+         if parallel_config.decode_context_parallel_size != 1:

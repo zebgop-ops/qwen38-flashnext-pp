@@ -1,0 +1,23 @@
+--- a/vllm/models/qwen4_exp/nvidia/ple_layer.py
++++ b/vllm/models/qwen4_exp/nvidia/ple_layer.py
+@@ -1268,6 +1268,20 @@
+                 existing_base_state,
+             )
+             existing_state[..., : self.conv_state_len] = safe_next_state
++            # HARDENING: initialize the speculative-extension columns
++            # [conv_state_len:] whenever prefill (re)initializes a state
++            # block. Prefill/decode only write [0:conv_state_len]; on a fresh
++            # cache block the tail is uninitialized VRAM (NaN patterns), and
++            # the spec-decode rollback gather can reach into it before the
++            # first full spec write heals it. Zero is the correct
++            # "no history" value.
++            if existing_state.shape[-1] > self.conv_state_len:
++                tail = existing_state[..., self.conv_state_len :]
++                existing_state[..., self.conv_state_len :] = torch.where(
++                    update_mask.view(num_prefills, 1, 1).expand_as(tail),
++                    torch.zeros_like(tail),
++                    tail,
++                )
+             conv_state.index_copy_(0, state_indices, existing_state)
+         return output
+ 

@@ -1,0 +1,55 @@
+--- a/vllm/v1/ple_offload/connector.py
++++ b/vllm/v1/ple_offload/connector.py
+@@ -97,6 +97,16 @@
+         self._request_queue: queue.Queue[PleOffloadRequest | None] = queue.Queue(
+             maxsize=1
+         )
++        # PP fix: _process_request stages inputs by copying from the runner's
++        # LIVE input buffers, which the next forward overwrites. At PP=1 the
++        # natural cadence keeps model thread and sender in step. Under pipeline
++        # parallelism rank 0 issues the next forward before the sender has
++        # staged the previous one, which either overflows the queue
++        # (queue.Full, killing the worker) or silently stages the wrong inputs.
++        # Gate each launch on staging of the previous request having completed.
++        # Only the small input copy is serialised, not the forward.
++        self._staged = threading.Event()
++        self._staged.set()
+         self._request_thread: threading.Thread | None = None
+         self._request_thread_ready = threading.Event()
+         self._zmq_ctx: zmq.Context | None = None
+@@ -266,6 +276,7 @@
+                 self._process_request(request, socket)
+         except Exception:
+             logger.exception("PLE request thread failed")
++            self._staged.set()  # do not strand a model thread waiting on us
+             os._exit(1)
+         finally:
+             self._request_thread_ready.set()
+@@ -279,6 +290,9 @@
+         else:
+             self._copy_cpu_inputs(request)
+ 
++        # Inputs are now copied out of the runner's live buffers; the model
++        # thread may safely produce the next forward's inputs.
++        self._staged.set()
+         with torch.cuda.nvtx.range("ple_offload.send_request"):
+             socket.send(msgspec.msgpack.encode(request))
+ 
+@@ -386,7 +400,16 @@
+             num_tokens=num_tokens,
+             num_reqs=num_reqs,
+         )
+-        self._request_queue.put_nowait(request)
++        # Block until the sender finished staging the previous request, so the
++        # runner cannot overwrite the input source mid-copy. Times out rather
++        # than hanging the engine if the sender thread has died.
++        if not self._staged.wait(timeout=60.0):
++            raise RuntimeError(
++                "PLE offload: previous request was not staged within 60s; "
++                "the request thread may have stalled."
++            )
++        self._staged.clear()
++        self._request_queue.put(request, timeout=60.0)
+ 
+     def prepare_forward(
+         self,

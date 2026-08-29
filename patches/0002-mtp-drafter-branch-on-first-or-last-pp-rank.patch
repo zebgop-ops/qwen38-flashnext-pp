@@ -1,0 +1,24 @@
+--- a/vllm/models/qwen3_8_flash_next/nvidia/mtp.py
++++ b/vllm/models/qwen3_8_flash_next/nvidia/mtp.py
+@@ -271,7 +271,20 @@
+         hc_count = self.hc_count
+         hidden_size = self.hidden_size
+ 
+-        if get_pp_group().is_first_rank:
++        # PP fix: the MTP drafter is a self-contained one-layer model that
++        # vLLM instantiates on the LAST pipeline rank, where it is handed the
++        # target model's hidden_states directly. It still consults the parent
++        # PP group, so under PP>1 is_first_rank is False and it takes the
++        # pipeline branch, asserting on intermediate_tensors that never arrive
++        # ("Data-dependent assertion failed (cannot compile partial graph)").
++        # Key the branch on what was actually supplied instead.
++        pp_group = get_pp_group()
++        if pp_group.is_first_rank or pp_group.is_last_rank:
++            # PR #46994: the drafter is only built on the LAST PP stage, where
++            # the target's hidden states are available locally, so the fc
++            # projection applies exactly as at PP=1. Without the last-rank case
++            # the draft falls through to the intermediate-tensor path and
++            # projects uninitialized state.
+             assert hidden_states is not None
+             if inputs_embeds is None:
+                 assert input_ids is not None

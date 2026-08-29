@@ -1,0 +1,60 @@
+--- a/vllm/v1/worker/gpu/block_table.py
++++ b/vllm/v1/worker/gpu/block_table.py
+@@ -71,9 +71,24 @@
+ 
+         # Block tables used for model's forward pass.
+         # num_kv_cache_groups x [max_num_reqs, max_num_blocks]
+-        self.input_block_tables: list[torch.Tensor] = [
+-            torch.zeros_like(b.gpu) for b in self.block_tables
++        # FIX (ours): a round-robin POOL of gathered-table sets. With one set,
++        # a later step's gather mutates the buffers while an earlier in-flight
++        # step's kernels may still read them (PP keeps up to
++        # max_concurrent_batches steps in flight). Rotating over
++        # VLLM_BT_POOL >= max_concurrent_batches + 1 sets gives each step an
++        # immutable view for its whole in-flight lifetime, with stable
++        # per-slot data_ptrs (unlike per-step clones, which dangle under the
++        # raw-pointer captures downstream).
++        import os as _os
++        self._num_table_sets = max(1, int(_os.environ.get("VLLM_BT_POOL", "1")))
++        self._table_set_idx = 0
++        self.input_block_tables_pool: list[list[torch.Tensor]] = [
++            [torch.zeros_like(b.gpu) for b in self.block_tables]
++            for _ in range(self._num_table_sets)
+         ]
++        self.input_block_tables: list[torch.Tensor] = (
++            self.input_block_tables_pool[0]
++        )
+ 
+         self.slot_mappings = torch.zeros(
+             self.num_kv_cache_groups,
+@@ -110,7 +125,12 @@
+         self.slot_mapping_enabled = torch.tensor(
+             self._slot_mapping_enabled, dtype=torch.bool, device=self.device
+         )
+-        self.input_block_table_ptrs = self._make_ptr_tensor(self.input_block_tables)
++        self.input_block_table_ptrs_pool = [
++            self._make_ptr_tensor(s) for s in self.input_block_tables_pool
++        ]
++        self.input_block_table_ptrs = self.input_block_table_ptrs_pool[
++            self._table_set_idx
++        ]
+ 
+     def append_block_ids(
+         self,
+@@ -151,6 +171,16 @@
+         if self.num_kv_cache_groups == 0:
+             return ()
+         if out is None:
++            # Rotate to the next pooled set (see __init__).
++            self._table_set_idx = (
++                self._table_set_idx + 1
++            ) % self._num_table_sets
++            self.input_block_tables = self.input_block_tables_pool[
++                self._table_set_idx
++            ]
++            self.input_block_table_ptrs = self.input_block_table_ptrs_pool[
++                self._table_set_idx
++            ]
+             out = tuple(self.input_block_tables)
+             out_ptrs = self.input_block_table_ptrs
+         else:

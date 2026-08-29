@@ -1,0 +1,23 @@
+--- a/vllm/v1/ple_offload/worker.py
++++ b/vllm/v1/ple_offload/worker.py
+@@ -245,6 +245,20 @@
+     ) -> None:
+         """Load PLE weights, accept registrations, and run the request loop."""
+         decorate_logs("PleOffloadWorker")
++        # This process is not a pipeline rank: it builds the PLE layers alone
++        # with pp_size=1. get_pp_indices() reads VLLM_PP_LAYER_PARTITION from
++        # the environment unconditionally, so an inherited 3-way split makes it
++        # raise "len(partitions)=3 does not match pp_size=1". A 1-rank pipeline
++        # has exactly one valid partition anyway, so drop the override here.
++        import os as _os
++        if _os.environ.pop("VLLM_PP_LAYER_PARTITION", None) is not None:
++            import vllm.envs as _envs
++            with contextlib.suppress(Exception):
++                _envs.VLLM_PP_LAYER_PARTITION = None
++            logger.info(
++                "Cleared VLLM_PP_LAYER_PARTITION in the PLE offload worker "
++                "(not a pipeline rank; builds with pp_size=1)."
++            )
+         ready_reader, ready_writer = ready_pipe
+         ready_reader.close()
+         shutdown_event = threading.Event()

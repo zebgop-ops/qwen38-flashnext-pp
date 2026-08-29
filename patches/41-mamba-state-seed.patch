@@ -1,0 +1,25 @@
+--- a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py	2026-08-27 17:25:29
++++ b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py	2026-08-27 17:25:29
+@@ -112,8 +112,21 @@
+         self.num_accepted_tokens_gpu[req_index].fill_(1)
+         if self._align_mode:
+             # Seed the running state block from the resumed/prefilled position.
++            # BCN81_STATE_SEED (fix from vllm#53142): the divisor must be the
++            # MAMBA group's block size, not the attention/CLI block size — on
++            # hybrids they differ, and a resume over a cached prefix then seeds
++            # an out-of-range block_table column -> the fused align precopy
++            # reads a garbage block id -> illegal memory access on request 2.
++            # _mamba_spec is populated by the first batch's preprocess_state;
++            # a resume can only happen after some batch has run, and fresh
++            # requests seed -1 either way, so the fallback is safe.
++            mamba_bs = (
++                self._mamba_spec.block_size
++                if self._mamba_spec is not None
++                else self.cache_config.block_size
++            )
+             self._mamba_state_idx_gpu[req_index].fill_(
+-                (new_req_data.num_computed_tokens - 1) // self.cache_config.block_size
++                (new_req_data.num_computed_tokens - 1) // mamba_bs
+             )
+ 
+     def _get_mamba_group_info(

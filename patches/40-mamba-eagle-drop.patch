@@ -1,0 +1,19 @@
+--- a/vllm/v1/core/single_type_kv_cache_manager.py	2026-08-27 17:25:29
++++ b/vllm/v1/core/single_type_kv_cache_manager.py	2026-08-27 17:25:29
+@@ -1399,6 +1399,16 @@
+         )
+         assert dcp_world_size == 1, "DCP not support mamba now."
+         assert pcp_world_size == 1, "PCP not support mamba now."
++        # BCN81_EAGLE_DROP (port of unmerged vllm#48375): EAGLE/MTP requires the
++        # final matched page of a cache hit be dropped — its recurrent-state
++        # snapshot may include draft tokens that verification later rejects, so
++        # resuming from it corrupts the GDN/mamba state (vllm#43559 lane).
++        # Upstream lowers max_num_blocks by one; lowering max_length by one
++        # mamba block is arithmetically identical for the coarse search below
++        # ((x - b)//b == x//b - 1) and ALSO correctly bounds the fine-grained
++        # partial-unit branch this tree adds, which upstream's diff predates.
++        if drop_eagle_block:
++            max_length = max(0, max_length - kv_cache_spec.block_size)
+         block_hashes = resolve_block_hashes(
+             block_hashes,
+             block_pool.hash_block_size,

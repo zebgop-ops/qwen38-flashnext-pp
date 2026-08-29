@@ -1,0 +1,17 @@
+--- a/vllm/models/qwen4_exp/nvidia/model.py
++++ b/vllm/models/qwen4_exp/nvidia/model.py
+@@ -569,6 +569,14 @@
+             "token_lookup",
+             "hyper_connection_mixer.block_inject_weight",
+         ]
++        # PP fix: the final GatedResidual is only constructed on the last PP
++        # rank (see __init__, which sets it to None elsewhere). None is not an
++        # nn.Module, so AutoWeightsLoader finds no home for the checkpoint's
++        # hyper_connection_mixer.* tensors on every other rank and raises
++        # "There is no module or parameter named 'hyper_connection_mixer'".
++        # Those weights genuinely belong to the last rank only, so skip them.
++        if not get_pp_group().is_last_rank:
++            skip_substrs.append("hyper_connection_mixer")
+         loader = AutoWeightsLoader(
+             self,
+             skip_substrs=skip_substrs,

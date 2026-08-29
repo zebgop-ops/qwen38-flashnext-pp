@@ -1,0 +1,26 @@
+--- a/vllm/v1/worker/mamba_utils.py
++++ b/vllm/v1/worker/mamba_utils.py
+@@ -364,7 +364,13 @@
+     if src_block_idx == dest_block_idx and accept_token_bias == 0:
+         return
+ 
+-    bt_row_idx = batch_idx if HAS_IDX_MAPPING else req_idx
++    # FIX (ours): the captured block tables are the SOURCE per-request-slot
++    # tables, so always index them by req_idx. The previous batch-row indexing
++    # read the CURRENT step's gathered tables at a (possibly stale) batch row
++    # -- on a non-last PP rank the deferred postprocess runs pp_size steps
++    # after its batch was gathered, so batch rows point at DIFFERENT requests
++    # and the align state copy walks another request's block ids.
++    bt_row_idx = req_idx
+     _copy_mamba_state_block(
+         state_idx,
+         bt_row_idx,
+@@ -498,7 +504,7 @@
+     token_bias = tl.load(token_bias_ptr + req_idx)
+     _copy_mamba_state_block(
+         state_idx,
+-        batch_idx,
++        req_idx,  # FIX (ours): source tables are req-indexed (see above)
+         src_col,
+         dst_col,
+         token_bias,

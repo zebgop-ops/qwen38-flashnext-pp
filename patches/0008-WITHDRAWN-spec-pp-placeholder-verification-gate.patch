@@ -1,0 +1,48 @@
+WITHDRAWN (2026-08-29) — DO NOT APPLY.
+This patch implemented the falsified "placeholder-forward verification
+commit" hypothesis (FINDINGS.md Addendum 2). The real corruption was later
+root-caused to stale gathered-block-table reads and is fixed by 0009+0010.
+Worse, this gate silently rejects every draft for any request rescheduled
+within pp_size sample-steps of its last — at concurrency 1 that is EVERY
+step, capping MTP decode at ~1 token/step (~2.5x throughput loss) while the
+pre-gate acceptance metric still reads normally (Addendum 18).
+Kept only as a historical record of the investigation.
+
+Subject: [Spec][PP] Never commit MTP verification decisions computed from
+ placeholder-input forwards
+
+Status: PROTOTYPE / RFC — design validated by measurement, code not yet
+verified end-to-end (see repro below). Applies on top of PR #46994.
+
+Under async pipeline-parallel scheduling, a request can be rescheduled
+before its previous outputs have propagated to the first rank. Rank 0 then
+embeds placeholder (zero-init) tokens for the sampled/draft positions.
+That is by design for plain decode: need_sampled bookkeeping ensures those
+forwards' samples are never used, and the state is rolled back.
+
+With MTP, however, rejection sampling on the last rank runs on the logits
+of that same placeholder-poisoned forward and its accept/reject decisions
+ARE committed. Accepted garbage converges on the drafter's unconditioned
+argmax, producing constant-token degenerate loops (~14-27% of requests
+whenever max_num_seqs >= 3; measured threshold exactly 2->3 slots, flat
+above, absent without PP or without MTP).
+
+Fix direction: extend the per-request need_sampled mask into the
+verification path. For any scheduled request whose inputs this step were
+built from unpropagated state (equivalently: need_sampled == False for
+the positions being verified), force num_accepted = 0 and exclude its
+bonus token from commitment, exactly mirroring how plain decode discards
+placeholder-forward samples.
+
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ (in sample_tokens, after rejection sampling produces num_sampled/num_rejected)
++        # PP + spec decode: verification decisions from placeholder-input
++        # forwards must not be committed (mirrors need_sampled handling for
++        # plain decode). Placeholder steps are those where the request was
++        # rescheduled before its prior outputs propagated (< pp_size steps).
++        if self.pp_handler is not None and self.speculative_config is not None:
++            stale = compute_placeholder_mask(input_batch, self.req_states)
++            if stale is not None and stale.any():
++                num_rejected[stale] += num_sampled[stale] - 1
++                num_sampled[stale] = 1  # keep only the (rolled-back) bonus slot

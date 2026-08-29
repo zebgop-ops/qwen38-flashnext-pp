@@ -1,0 +1,68 @@
+--- a/vllm/models/qwen3_8_flash_next/nvidia/model_state.py
++++ b/vllm/models/qwen3_8_flash_next/nvidia/model_state.py
+@@ -14,6 +14,44 @@
+ from vllm.v1.worker.gpu.states import RequestState
+ 
+ 
++def _ple_confined_to_first_pp_rank(vllm_config) -> bool:
++    """True when every PLE n-gram layer lives on the first pipeline rank.
++
++    The PLE lookup needs raw input_ids, which only the first PP rank receives.
++    That makes PP unsafe in general -- but not when the PLE layers all sit on
++    rank 0, which is the only place they can afford to be anyway: the n-gram
++    table is ~50 GiB in one layer, so a memory-balanced partition puts it alone
++    on stage 0 (e.g. VLLM_PP_LAYER_PARTITION=2,23,23). In that layout the
++    "inject on first rank only" behaviour is exactly correct.
++    """
++    import os
++    cfg = vllm_config.model_config.hf_text_config
++    ple = tuple(getattr(cfg, "ple_layer_ids", ()) or ())
++    if not ple:
++        return True
++    pp = vllm_config.parallel_config.pipeline_parallel_size
++    if pp <= 1:
++        return True
++    n = int(cfg.num_hidden_layers)
++    spec = os.getenv("VLLM_PP_LAYER_PARTITION", "")
++    if spec:
++        try:
++            parts = [int(x) for x in spec.split(",")]
++        except ValueError:
++            return False
++        if len(parts) != pp or sum(parts) != n:
++            return False
++        first_end = parts[0]
++    else:
++        first_end = n // pp          # even split, matches make_layers
++    # ple_layer_ids are 1-based relative to vLLM's 0-based layer index: the
++    # model attaches PLE where "(self.layer_idx + 1) in ple_layer_ids"
++    # (nvidia/model.py). So ple id 2 lives on layer_idx 1, which the checkpoint
++    # confirms -- the ~50 GiB n-gram tensors are under layers.1.ple.*.
++    # Require every PLE layer_idx inside rank 0's [0, first_end).
++    return all(0 <= int(i) - 1 < first_end for i in ple)
++
++
+ class Qwen3_8FlashNextModelState(MambaHybridModelState):
+     """Add rollback-safe PLE n-gram context to the model inputs."""
+ 
+@@ -32,12 +70,15 @@
+             self.ngram_eos_token_id = 0
+             return
+ 
+-        if vllm_config.parallel_config.pipeline_parallel_size > 1:
++        if (
++            vllm_config.parallel_config.pipeline_parallel_size > 1
++            and not _ple_confined_to_first_pp_rank(vllm_config)
++        ):
+             raise RuntimeError(
+-                "N-gram PLE embedding currently requires "
+-                "pipeline_parallel_size=1 because non-first pipeline ranks do "
+-                "not receive the raw input_ids required by PLE. Please run "
+-                "with PP=1."
++                "N-gram PLE embedding requires pipeline_parallel_size=1 unless "
++                "every PLE layer sits on the first pipeline rank, because only "
++                "that rank receives the raw input_ids PLE needs. Pin the split "
++                "with VLLM_PP_LAYER_PARTITION so the PLE layers land on rank 0."
+             )
+ 
+         self.ngram_context_len = int(config.ngram_size) - 1
