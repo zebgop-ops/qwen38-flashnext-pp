@@ -1,11 +1,17 @@
 # Results
 
+Model: **Qwen/Qwen3.8-Flash-Next-FP8** — the official FP8 checkpoint
+(block-wise FP8 weights, ~126 GiB incl. the ~50 GiB FP8 n-gram PLE table;
+KV cache stays bf16 — `--kv-cache-dtype fp8` is refused by the QSA layers).
+
 All measurements on **3× NVIDIA CMP 170HX** (GA100, sm_80, 64 GiB each),
 **PCIe Gen2 x4**, no NVLink, no P2P (`NCCL_P2P_DISABLE=1`) — about as hostile
 an interconnect as PP ever sees. Serving config: PP=3 (`16,16,16` layer
 partition), MTP `num_speculative_tokens=3`, **prefix caching ON**, HUMMING MoE
-backend, PIECEWISE CUDA graphs, `mamba_ssm_cache_dtype=float32`, PLE table on
-CPU (`VLLM_PLE_CPU_OFFLOAD=1`), `max_model_len=262144`, `max_num_seqs=8`,
+backend (the only FP8-block-quant MoE path that works on sm_80: Marlin faults
+in `gptq_marlin_repack` and Triton declines block-wise FP8 outright),
+PIECEWISE CUDA graphs, `mamba_ssm_cache_dtype=float32`, FP8 PLE table served
+from CPU (`VLLM_PLE_CPU_OFFLOAD=1`), `max_model_len=262144`, `max_num_seqs=8`,
 935k KV tokens pooled. All patches from this repo applied.
 
 ## Decode throughput (tok/s)
