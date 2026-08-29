@@ -37,8 +37,10 @@ done
     patch -p1 --forward < "$f" && echo "applied $(basename "$f")"
   done )
 for out in "${!SRC[@]}"; do cp "work/vllm/${SRC[$out]}" "$OUT/$out"; done
+# Overlay the wholesale-ported files (see ported-files/README.md): these are
+# complete replacements the numbered patches do not reconstruct from stock.
+for f in ported-files/*.py; do cp "$f" "$OUT/$(basename "$f")"; done
 for f in "$OUT"/*.py; do python3 -m py_compile "$f"; done
 echo "patched tree ready in $OUT/ ($(ls "$OUT" | wc -l) files)"
-echo "NOTE: pp_utils.py / v2_model_runner.py / connector.py etc. carry larger"
-echo "PP-port changes whose full-file diffs are in patches/; if a hunk fails"
-echo "against a newer image, see patches-rebased-head/ and FINDINGS.md."
+echo "NOTE: if a patch hunk fails against a newer image, see"
+echo "patches-rebased-head/ and FINDINGS.md."
