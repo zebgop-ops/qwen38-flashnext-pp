@@ -1,0 +1,26 @@
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -640,6 +640,23 @@
+         """
+         maybe_apply_startup_plan(self)
+ 
++        # PATCH (ours): per-rank KV budget override. --kv-cache-memory is a
++        # single value for every worker, but under PP the ranks are
++        # heterogeneous (PLE machinery on rank 0, the MTP drafter on the last
++        # rank, different per-token KV costs), so one global value must fit
++        # the tightest rank and strands memory everywhere else. Let each rank
++        # take its own absolute budget from VLLM_KV_CACHE_MEMORY_RANK<i>.
++        import os as _os
++        _pp_rank = get_pp_group().rank_in_group
++        _override = _os.getenv(f"VLLM_KV_CACHE_MEMORY_RANK{_pp_rank}")
++        if _override and not self.cache_config.kv_cache_memory_bytes:
++            self.cache_config.kv_cache_memory_bytes = int(_override)
++            logger.info(
++                "Per-rank KV budget override: pp_rank=%d takes %s GiB from "
++                "VLLM_KV_CACHE_MEMORY_RANK%d",
++                _pp_rank, format_gib(int(_override)), _pp_rank,
++            )
++
+         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
+             # still need a profile run which compiles the model for
+             # max_num_batched_tokens

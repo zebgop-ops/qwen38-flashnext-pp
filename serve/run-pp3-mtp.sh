@@ -4,6 +4,15 @@
 #   decode  74 tok/s C1 / 248 C4 / 440 C8 (speedrun.py, ocean-currents prompt)
 #           story-style prompts ~66 C1; C>=4 aggregate varies with MoE routing
 #   prefill 9.6-10.5k tok/s (32k unique prompts, C1-C3)
+# PER-RANK KV BUDGETS (2026-08-29, gpu_worker.py patch): the global 0.94
+# utilization strands ~3 GiB/rank because PP ranks are heterogeneous.
+# VLLM_KV_CACHE_MEMORY_RANK{0,1,2} below set each rank to vLLM's own
+# suggested max minus margin (0.5/0.5/1.0 GiB). Pool: 935,216 -> 1,116,591
+# tokens (+19.4%, 4.26x full-ctx). Validated: 0/160 soak, 253k needle exact
+# with no OOM at the activation peak.
+# 1M CONTEXT VERIFIED: QWEN38_YARN=4.0 QWEN38_MAXLEN=1048576 boots with a
+# 1,220,499-token pool (1.16x) and recalled a needle from a 1,041,971-token
+# prompt exactly (189.6s, ~5.5k tok/s prefill). Opt-in via those env vars.
 # MTP depth sweep 2026-08-29 (QWEN38_SPEC): C1/C8-median/acceptance:
 #   N=1 61/214/79%  N=2 71/267/68%  N=3 75/371/57%  N=4 79/274/50%
 #   N=5 refuses to boot (QSA ring capacity 12 must divide the block size).
@@ -119,6 +128,8 @@ docker run -d --name "$NAME" --gpus all --ipc=host --shm-size=32g \
   -e HF_HOME=/hf \
   -e VLLM_PLE_CPU_OFFLOAD=1 -e VLLM_USE_FLASHINFER_SAMPLER=0 \
   -e VLLM_ENGINE_READY_TIMEOUT_S=5400 -e VLLM_BT_POOL=5 \
+  -e VLLM_KV_CACHE_MEMORY_RANK0=17212851712 -e VLLM_KV_CACHE_MEMORY_RANK1=19231211520 \
+  -e VLLM_KV_CACHE_MEMORY_RANK2=13324086784 \
   ${YARN:+-e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1} \
   -e NCCL_P2P_DISABLE=1 -e NCCL_IB_DISABLE=1 \
   -e VLLM_PP_LAYER_PARTITION="$PARTITION" \

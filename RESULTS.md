@@ -78,12 +78,31 @@ UUID-first 8-way soak, prefix caching on:
 ctx captures raw pointers to one gathered set while the pool rotates through
 the others; it is kept as cheap defense-in-depth.
 
+## KV capacity (per-rank budgets, patch 0014)
+
+`--kv-cache-memory` is one value for every worker, but heterogeneous PP
+ranks (PLE on rank 0, drafter on the last rank, differing per-token KV
+costs) strand ~3 GiB/rank under a uniform budget. Patch 0014 lets each rank
+take its own budget from `VLLM_KV_CACHE_MEMORY_RANK<i>`; set to vLLM's own
+suggested maxima minus 0.5/0.5/1.0 GiB margins:
+
+- pool: **935,216 → 1,116,591 tokens (+19.4%)**, 4.26× full-context (262k)
+  concurrency — validated with a clean 0/160 soak and an exact 253k-token
+  needle recall with no OOM at the activation peak.
+- Layer re-partitioning cannot achieve this: every single-layer move makes
+  some rank a worse limiter (a 2.48 GiB layer weight dwarfs the KV slack).
+
 ## Context length
 
 - **262,144 native context verified**: 260k-token needle recall in 35.7 s.
 - Optional static YaRN factor 2.0 → **524,288**: 500k-token needle recall
   verified, short-context spot checks unchanged (off by default per Qwen's
   static-YaRN guidance).
+- **1M context verified** (enabled by patch 0014's larger pool): YaRN factor
+  4.0 + `max_model_len=1048576` boots with a 1,220,499-token pool (1.16×
+  one full sequence) and recalled a needle from a **1,041,971-token prompt
+  exactly** — 189.6 s wall, ~5.5k tok/s prefill at the 1M scale. Opt-in:
+  `QWEN38_YARN=4.0 QWEN38_MAXLEN=1048576`.
 
 ## Why PP wins on this interconnect
 

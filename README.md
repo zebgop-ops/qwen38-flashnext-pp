@@ -76,6 +76,7 @@ Correctness — the prefix-caching corruption and its relatives:
 | 0011 | Port of unmerged vllm#48375 (`MambaManager` honors `drop_eagle_block`) — resume-path state poisoning |
 | 0012 | Fix for vllm#53142 (**no upstream PR exists**): state-seed divisor must be the mamba group's block size |
 | 0013 | Zero-init the PLE spec-extension state columns on prefill (uninit-VRAM NaN hardening) |
+| 0014 | Per-rank KV budgets via `VLLM_KV_CACHE_MEMORY_RANK<i>` — +19.4% KV pool on heterogeneous PP ranks; unlocks 1M context (see RESULTS.md) |
 
 Also shipped: `ported-files/` (the vllm#46994 MTP-under-PP relay port —
 `pp_utils.py` + the V2 runner — and vllm#53877's fp32 GDN beta), which are
