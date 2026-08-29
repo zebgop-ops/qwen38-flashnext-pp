@@ -5,8 +5,10 @@ Model: **Qwen/Qwen3.8-Flash-Next-FP8** — the official FP8 checkpoint
 KV cache stays bf16 — `--kv-cache-dtype fp8` is refused by the QSA layers).
 
 All measurements on **3× NVIDIA CMP 170HX** (GA100, sm_80, 64 GiB each),
-**PCIe Gen2 x4**, no NVLink, no P2P (`NCCL_P2P_DISABLE=1`) — about as hostile
-an interconnect as PP ever sees. Serving config: PP=3 (`16,16,16` layer
+**power-limited to 200 W per card** (`nvidia-smi -pl 200`), **PCIe Gen2 x4**,
+no NVLink, no P2P (`NCCL_P2P_DISABLE=1`) — about as hostile an interconnect
+as PP ever sees. Stock-power cards should do somewhat better on the
+compute-bound numbers (prefill, C8 decode). Serving config: PP=3 (`16,16,16` layer
 partition), MTP `num_speculative_tokens=3`, **prefix caching ON**, HUMMING MoE
 backend (the only FP8-block-quant MoE path that works on sm_80: Marlin faults
 in `gptq_marlin_repack` and Triton declines block-wise FP8 outright),
