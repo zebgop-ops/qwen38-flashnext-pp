@@ -8,13 +8,18 @@ All measurements on **3× NVIDIA CMP 170HX** (GA100, sm_80, 64 GiB each),
 **power-limited to 200 W per card** (`nvidia-smi -pl 200`), **PCIe Gen2 x4**,
 no NVLink, no P2P (`NCCL_P2P_DISABLE=1`) — about as hostile an interconnect
 as PP ever sees. Stock-power cards should do somewhat better on the
-compute-bound numbers (prefill, C8 decode). Serving config: PP=3 (`16,16,16` layer
-partition), MTP `num_speculative_tokens=3`, **prefix caching ON**, HUMMING MoE
-backend (the only FP8-block-quant MoE path that works on sm_80: Marlin faults
-in `gptq_marlin_repack` and Triton declines block-wise FP8 outright),
-PIECEWISE CUDA graphs, `mamba_ssm_cache_dtype=float32`, FP8 PLE table served
-from CPU (`VLLM_PLE_CPU_OFFLOAD=1`), `max_model_len=262144`, `max_num_seqs=8`,
-935k KV tokens pooled. All patches from this repo applied.
+compute-bound numbers (prefill, C8 decode). Serving config: PP=3, MTP
+`num_speculative_tokens=3`, **prefix caching ON**, HUMMING MoE backend (the
+only FP8-block-quant MoE path that works on sm_80: Marlin faults in
+`gptq_marlin_repack` and Triton declines block-wise FP8 outright), PIECEWISE
+CUDA graphs, `mamba_ssm_cache_dtype=float32`, FP8 PLE table served from CPU
+(`VLLM_PLE_CPU_OFFLOAD=1`), `max_model_len=262144`, `max_num_seqs=8`. All
+patches from this repo applied.
+
+Two partitions appear below, both current: the **balanced `16,16,16`**
+(throughput-first, used for the decode/prefill tables) and the **capacity-first
+`16,17,15`** (production default; +22% KV for −6% single-stream decode). See
+*KV capacity* for both pool sizes.
 
 ## Decode throughput (tok/s)
 
@@ -86,11 +91,19 @@ costs) strand ~3 GiB/rank under a uniform budget. Patch 0014 lets each rank
 take its own budget from `VLLM_KV_CACHE_MEMORY_RANK<i>`; set to vLLM's own
 suggested maxima minus 0.5/0.5/1.0 GiB margins:
 
-- pool: **935,216 → 1,116,591 tokens (+19.4%)**, 4.26× full-context (262k)
-  concurrency — validated with a clean 0/160 soak and an exact 253k-token
-  needle recall with no OOM at the activation peak.
-- Layer re-partitioning cannot achieve this: every single-layer move makes
-  some rank a worse limiter (a 2.48 GiB layer weight dwarfs the KV slack).
+- balanced `16,16,16`: pool **935,216 → 1,116,591 tokens (+19.4%)**, 4.26×
+  full-context (262k) concurrency — validated with a clean 0/160 soak and an
+  exact 253k-token needle recall with no OOM at the activation peak.
+- capacity-first `16,17,15` + rebalanced budgets (**production default**):
+  **1,359,009 tokens, 5.18×** full-context — i.e. **+45% over the uniform
+  baseline**, costing ~6% single-stream decode (74 → ~70 tok/s) because the
+  17-layer rank sets the pipeline step time; 8-way aggregate is unaffected.
+  Validated at `max_num_seqs=5`: **5 concurrent ~241k-token needles, 5/5
+  exact** (1.21M tokens resident, ~8.3k tok/s aggregate prefill), 0/115 soak,
+  48/48 hit-path recalls.
+- Note the two knobs interact: under a *uniform* budget, shifting layers only
+  makes some rank a worse limiter. It is per-rank budgets that make the
+  `16,17,15` shift pay, by letting the freed rank actually claim the memory.
 
 ## Context length
 
