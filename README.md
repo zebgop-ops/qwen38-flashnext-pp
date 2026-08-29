@@ -26,6 +26,11 @@ other eight apply to head unchanged. `tools/` has the validated loop
 detector and soak harnesses. `FINDINGS.md` is the full investigation log
 (19 addenda). **Do not apply `0008-WITHDRAWN-*`** — kept only as history.
 
+Related prior work: [allover326/vllm-dsa-mtp-sm80](https://github.com/allover326/vllm-dsa-mtp-sm80)
+— MTP-under-PP for DeepSeek on sm_80, whose setup notes
+(`VLLM_USE_FLASHINFER_SAMPLER=0`, drafter placement on the last PP rank)
+informed this work.
+
 Benchmarks & validation: see **[RESULTS.md](RESULTS.md)** — decode/prefill
 throughput, prefix-cache hit rates and TTFT, the MTP depth sweep, the fix
 ablation, and long-context verification.
