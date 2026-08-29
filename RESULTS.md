@@ -104,6 +104,38 @@ suggested maxima minus 0.5/0.5/1.0 GiB margins:
   exactly** — 189.6 s wall, ~5.5k tok/s prefill at the 1M scale. Opt-in:
   `QWEN38_YARN=4.0 QWEN38_MAXLEN=1048576`.
 
+## Cost of the CPU PLE offload
+
+The ~50 GiB FP8 n-gram (PLE) table is served from CPU RAM via
+`VLLM_PLE_CPU_OFFLOAD=1`, which raises the obvious question of what that
+costs. It cannot be A/B'd on 3 cards — with the table resident on GPU, rank 0
+is fully consumed by it (L0+L1 = 55.2 GiB) and the remaining 46 layers do not
+fit on two cards (they OOM inside `transform_humming_weight`, which needs
+~1.6 GiB of transient repack scratch on top of resident weights, with or
+without MTP). So the offload worker was instrumented instead.
+
+Measured at concurrency-1 decode (medians over 200 forwards):
+
+| | ms |
+|---|---:|
+| forward period | 34.81 |
+| **total offload service** | **0.69 (2.0% of the step)** |
+| ├ CPU n-gram lookup | 0.51 |
+| ├ H2D copy enqueue | 0.09 |
+| └ CPU blocked waiting on GPU | 0.04 |
+
+**The offload costs at most ~2% of a decode step**, and that is an upper
+bound — it assumes the GPU stalls for the entire service window rather than
+overlapping it. The near-zero "blocked waiting on GPU" term shows the CPU
+worker runs ahead of the model rather than gating it. Serving this table from
+host RAM is essentially free; it is not a reason to add GPUs.
+
+*Method note:* the GPU-side wait is a `cuStreamWaitValue32` **stream stall**
+that is captured *into* the piecewise CUDA graph, so instrumenting the Python
+impl of `vllm::ple_offload_wait` measures nothing on replay and raises
+`cudaErrorStreamCaptureInvalidated` if events are queried there. The
+CPU-side offload worker is the only viable vantage point.
+
 ## Why PP wins on this interconnect
 
 Compared with expert-parallel (DEP3) on the same box, PP3 is ~5× faster at
