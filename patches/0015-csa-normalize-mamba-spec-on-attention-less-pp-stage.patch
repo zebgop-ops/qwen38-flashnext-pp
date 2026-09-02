@@ -1,0 +1,31 @@
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -1835,7 +1835,7 @@
+             "CSA+linear layers must share one block size, compression ratio, "
+             "and main_kv/compressed page size."
+         )
+-    ratio, _, main_kv_page, compressed_page = next(iter(shapes))
++    ratio, main_kv_block, main_kv_page, compressed_page = next(iter(shapes))
+     prefix_match_unit = vllm_config.cache_config.prefix_match_unit
+     if (
+         vllm_config.cache_config.enable_prefix_caching
+@@ -1882,7 +1882,18 @@
+         if not names:
+             continue
+         representative = roles.mamba[names[0]]
+-        if any(roles.mamba[name] != representative for name in names[1:]):
++        # FIX: a PP stage that holds NO attention layer (e.g. rank 0 carrying
++        # only L0 + the PLE layer when the n-gram table is resident on GPU)
++        # never runs the per-rank "pad mamba page to attention page"
++        # negotiation, so its mamba specs arrive with the default block_size
++        # and page_size_padded=None while every other stage's say 1600 /
++        # main_kv_page. Both fields are re-derived from main_kv geometry right
++        # below (padded_spec), so compare on the normalized spec and take the
++        # negotiated block size as the representative.
++        def _norm(spec):
++            return replace(spec, block_size=main_kv_block, page_size_padded=None)
++        representative = _norm(representative)
++        if any(_norm(roles.mamba[name]) != representative for name in names[1:]):
+             policy = "replicated" if tp_replicated else "sharded"
+             raise ValueError(
+                 f"CSA+linear {policy} mamba cache owners must use one spec."

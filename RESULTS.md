@@ -4,7 +4,7 @@ Model: **Qwen/Qwen3.8-Flash-Next-FP8** — the official FP8 checkpoint
 (block-wise FP8 weights, ~126 GiB incl. the ~50 GiB FP8 n-gram PLE table;
 KV cache stays bf16 — `--kv-cache-dtype fp8` is refused by the QSA layers).
 
-All measurements on **3× NVIDIA CMP 170HX** (GA100, sm_80, 64 GiB each),
+All measurements below the *Update* section on **3× NVIDIA CMP 170HX** (GA100, sm_80, 64 GiB each),
 **power-limited to 200 W per card** (`nvidia-smi -pl 200`), **PCIe Gen2 x4**,
 no NVLink, no P2P (`NCCL_P2P_DISABLE=1`) — about as hostile an interconnect
 as PP ever sees. Stock-power cards should do somewhat better on the
@@ -20,6 +20,69 @@ Two partitions appear below, both current: the **balanced `16,16,16`**
 (throughput-first, used for the decode/prefill tables) and the **capacity-first
 `16,17,15`** (production default; +22% KV for −6% single-stream decode). See
 *KV capacity* for both pool sizes.
+
+## Update 2026-09-02: four cards, PP=4, full CUDA graphs
+
+A 4th CMP 170HX went in (bus 01/21/41/42, all PCIe Gen2 x4, no P2P — every pair
+host-bounces at 0.78 GB/s). New production default: **partition `12,12,12,12`,
+`cudagraph_mode=FULL_AND_PIECEWISE`, per-rank KV budgets, `max_num_seqs=8`,
+MTP N=3, PLE table still on CPU.** Everything else as above.
+
+| | PP3 `16,17,15` PIECEWISE (old default) | PP4 `12,12,12,12` PIECEWISE | **PP4 `12,12,12,12` FULL_AND_PIECEWISE** |
+|---|---|---|---|
+| C1 decode (tok/s) / step | 70–74 / 34.8 ms | 59 / 44.2 ms | **89 / 30.0 ms** |
+| C4 / C8 decode (tok/s) | 248 / 371–440 | 199–254 / 372 | **254 / 429–433** |
+| 32k single-prompt prefill | 9.6k | 11.2k | **11.1–11.3k** |
+| 250k needle prefill | 8.6k | 10.3k | **10.6k** |
+| KV pool (tokens) | 1,359,009 (5.18×) | 2,537,837 | **2,537,837 (9.68×)** |
+
+**Where the PP4 single-stream loss came from.** Adding a stage cost +9.4 ms per
+decode step with identical tokens/step. A torch-profiler cross-rank timeline
+(all ranks share the host clock; only CPU-side events are captured on these
+cards) put it beyond doubt: at C1 each 12-layer stage occupied ~9.2 ms, the
+drafter rank 10.0 ms (its three draft forwards cost <1 ms), all three hops
+together 0.4 ms, and the relay's three NCCL broadcasts 0.13 ms (a 3-vs-4-rank
+microbenchmark in the same image showed the wire is identical). With 4 tokens
+per step the GPU work per stage is a few ms of expert reads, so **the stages
+are CPU-dispatch-bound — Python launching 12 layers piecewise — and a fourth
+stage adds a fourth helping.** Full CUDA graphs replay a whole stage's decode
+step in one launch: 44.2 → 30.0 ms, better than PP3 ever was. (The launcher had
+pinned `-cc.cudagraph_mode=PIECEWISE`; a later `--compilation-config` is
+silently overridden by the dotted form — check the engine's `Initializing`
+line, not the CLI.) Things that did *not* fix it: MTP N=4 (+6% C1, −12% C8,
+−2.6% pool), moving layers off the drafter rank (`13,13,13,9` — nothing to
+gain at C1, where stages run serially, and <1 ms at C8).
+
+**Full graphs × the block-table pool (patch 0009) corrupt state.** With
+`VLLM_BT_POOL=6` and full graphs the UUID soak produced 10/144 'duct' loops —
+the original NaN-state signature — after ~10 minutes. A captured graph bakes
+the pointer of the *one* pool slot current at capture time, so five of every
+six replays run the GDN/QSA/PLE state kernels against stale block tables. The
+pool was always optional (0010 alone is necessary and sufficient, see the
+ablation); the launcher now forces `VLLM_BT_POOL=1` whenever the mode is
+`FULL*`. With that: **UUID soak 0/168, hit-path 16 conversations × 8 turns 0
+loops (46/48 planted-code recalls), 250k needle exact, 8 concurrent ~241k
+needles 8/8 exact with 1.93M tokens resident (10.6k tok/s aggregate prefill).**
+
+**KV sizing on 4 cards.** Discovery boot at uniform 0.94 utilization gave
+2,309,701 tokens (drafter rank binds); vLLM's per-rank "fully utilize" maxima
+minus margins (0.5 GiB on ranks 0–2, 1.0 GiB on the drafter rank) →
+`28089402880 / 30123884544 / 30123884544 / 24216759808` bytes → **2,537,837
+tokens**, within 0.1% of the projection. Measured per-rank footprint: 12
+layers 34.0–34.3 GiB, 12 layers + drafter 37.9 GiB, plus ~1.6 GiB transient
+HUMMING repack scratch at load.
+
+**Putting the n-gram table in VRAM is architecturally blocked.** A `2,…`
+partition (rank 0 = embedding + PLE only) has no attention layer, so (a) its
+mamba specs arrive un-normalized (`block_size` 16 vs 1600 — patch 0015 fixes
+that comparison) and then (b) the CSA layout planner refuses: "pipeline stage
+has mamba cache owners but no main_kv tensor slots" — the GDN/PLE state pages
+are carved inside the same-stage QSA tensors, and rank 0 cannot also fit a QSA
+layer next to the 50 GiB table. The CPU offload costs ~2% of a step; it stays.
+
+**Cold numbers lie.** Right after boot the first 32k prefill read 5.4k tok/s
+(JIT) and the first C8 run 216; warm they are 11.2k and 372+. Warm up before
+judging any configuration.
 
 ## Decode throughput (tok/s)
 

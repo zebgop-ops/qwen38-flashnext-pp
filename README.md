@@ -1,4 +1,4 @@
-# Qwen3.8-Flash-Next: PP3 + MTP + prefix caching on vLLM
+# Qwen3.8-Flash-Next: pipeline parallel (3–4 cards) + MTP + prefix caching on vLLM
 
 Patches, root-cause forensics, benchmarks, and a runnable serving setup for
 **Qwen/Qwen3.8-Flash-Next-FP8** on vLLM with **pipeline parallelism (PP=3),
@@ -72,11 +72,12 @@ Correctness — the prefix-caching corruption and its relatives:
 | # | Fix |
 |---|-----|
 | **0010** | **THE FIX** — mamba ctx captures source req-indexed block tables; copy kernels index by `req_idx` |
-| 0009 | Round-robin pool of gathered-table sets (`VLLM_BT_POOL ≥ pp+2`) — optional defense-in-depth; does **not** fix the bug alone |
+| 0009 | Round-robin pool of gathered-table sets (`VLLM_BT_POOL ≥ pp+2`) — optional defense-in-depth; does **not** fix the bug alone. **Incompatible with full CUDA graphs** (a captured graph bakes one slot's pointer → stale tables → the original corruption); set `VLLM_BT_POOL=1` with `FULL_AND_PIECEWISE`, which is the new default |
 | 0011 | Port of unmerged vllm#48375 (`MambaManager` honors `drop_eagle_block`) — resume-path state poisoning |
 | 0012 | Fix for vllm#53142 (**no upstream PR exists**): state-seed divisor must be the mamba group's block size |
 | 0013 | Zero-init the PLE spec-extension state columns on prefill (uninit-VRAM NaN hardening) |
 | 0014 | Per-rank KV budgets via `VLLM_KV_CACHE_MEMORY_RANK<i>` — +19.4% KV pool on heterogeneous PP ranks; unlocks 1M context (see RESULTS.md) |
+| 0015 | CSA layout: normalize mamba specs from an attention-less PP stage before the "one spec" check (needed by any `2,…` partition; the PLE-in-VRAM attempt still dies at the next planner check — see RESULTS.md) |
 
 Also shipped: `ported-files/` (the vllm#46994 MTP-under-PP relay port —
 `pp_utils.py` + the V2 runner — and vllm#53877's fp32 GDN beta), which are
@@ -97,6 +98,19 @@ also silently caps concurrency-1 MTP at 1 token/step.
 | `FINDINGS.md` | full investigation log, 19 addenda — every hypothesis, including the falsified ones, and which instrument decided each |
 
 ## Related work
+
+**Upstream status (2026-09-02).** vllm-project/vllm#53896 (*Support
+Qwen3.8-Flash-Next*, merged 2026-08-31) brings the model into main; the CPU
+PLE offload is vllm#53899 (open). The image this repo patches
+(`0.1.dev20073+g8e685d198`) was built from a tree whose commit is not on the
+public `release/qwen38next_offload` branch, so the rebased set targets branch
+head instead. Open PRs worth watching for this setup: vllm#52297 (GDN metadata
+computed once per step instead of per cache group — our PP4 stages are
+CPU-dispatch-bound, so this is directly relevant), vllm#54296 (bounds guard in
+the V2 slot-mapping kernel), vllm#48815 (opt-in MTP mamba align-mode
+prefix-cache retention), vllm#54846 (fp8/nvfp4 KV on the QSA path — today
+`--kv-cache-dtype fp8` is refused), vllm#54912 (lifts the QSA ring
+divisibility that blocks MTP N≥5).
 
 Upstream: [vllm#54173](https://github.com/vllm-project/vllm/issues/54173)
 (sm_121 IMA — same fault family, loud variant),

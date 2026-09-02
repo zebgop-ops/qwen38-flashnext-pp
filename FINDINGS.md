@@ -407,3 +407,49 @@ pointers to ONE gathered set while gathers rotate through the others; with
 is defense-in-depth for any OTHER late gathered-table read (none observed:
 0010-only soaked clean). Production keeps VLLM_BT_POOL=5 as cheap hardening;
 upstream should land 0010 as the fix and may take 0009 as optional.
+
+
+## Addendum 20: PLE-in-VRAM is blocked by the CSA layout (patch 0015 context)
+
+With a 4th card the obvious move was a `2,16,15,15` partition with the 50 GiB
+n-gram table on rank 0. Two walls: (1) an attention-less stage skips the
+per-rank "pad mamba page to attention page" negotiation, so its mamba specs
+carry `block_size=16 / page_size_padded=None` while every other stage says
+1600 — the "sharded mamba cache owners must use one spec" check trips on a
+difference that is re-derived anyway (patch 0015 compares normalized specs);
+(2) the planner then refuses "pipeline stage has mamba cache owners but no
+main_kv tensor slots; realign the pipeline partition": GDN/PLE state pages are
+carved inside same-stage QSA tensors, and rank 0 cannot host a QSA layer next
+to the table. Abandoned; the CPU offload costs ~2% of a step (Addendum 19
+measurement) and stays. Lesson learned the hard way on the way there: a `2,23,23`
+attempt over-committed the last rank (67.8 GiB needed) and faulted at load
+with an illegal memory access instead of a clean OOM, wedging GSP firmware
+(`NVRM: GspRmAlloc failed status=0x62`) — reboot required. Size partitions
+from measured per-rank totals plus the ~1.6 GiB HUMMING repack scratch.
+
+## Addendum 21: PP4 lost single-stream speed; stages are CPU-dispatch-bound; full CUDA graphs fix it
+
+Even split `12,12,12,12` with per-rank budgets: pool 2,537,837 tokens but C1
+decode 59 tok/s at 44.2 ms/step vs PP3's 74 at 34.8, with identical tokens per
+step. Wire exonerated by a 3-vs-4-rank collective microbenchmark in the image
+(relay 0.13 ms, 4-token hop chain 0.14 ms, gloo metadata 0.24 ms — identical).
+The torch profiler captures only CPU events on these cards, but ranks share
+the host clock, so a cross-rank timeline of one decode step was possible: rank
+1/2 stage 9.2 ms each, drafter rank 10.0 ms, hops 0.4 ms, tail (rank 0 stage +
+engine) 20 ms. A 12-layer stage at 4 tokens is a few ms of GPU work; the rest
+is Python dispatch of piecewise graphs. `FULL_AND_PIECEWISE` (the launcher had
+it pinned to PIECEWISE with `-cc.cudagraph_mode=`, which overrides any later
+`--compilation-config`) → 30.0 ms/step, 89 tok/s C1, 429 C8, prefill
+unchanged, pool unchanged. MTP N=4 and drafter-rank relief were measured and
+rejected (RESULTS.md).
+
+## Addendum 22: full CUDA graphs × block-table pool = the old corruption, back
+
+First full-graph soak: 10/144 'duct' loops from round 15 on, `VLLM_BT_POOL=6`.
+Mechanism: the pool rotates the gathered-table buffers per step; a captured
+graph holds the pointer of whichever slot was current at capture, so 5/6
+replays run the captured GDN/QSA/PLE state kernels against stale tables —
+writes through freed/reallocated block ids, exactly the Addendum 16 bug by a
+different road. Pool=1 (0010 alone, proven sufficient in Addendum 19): 0/168
+soak, hit-path 0 loops, needles exact. Rule: any rotating per-step buffer that
+a captured op reads is a full-graph hazard; persistent buffers only.

@@ -1,98 +1,53 @@
 #!/bin/bash
-# Qwen3.8-Flash-Next-FP8, PIPELINE PARALLEL 3 + MTP, on 3x CMP 170HX.
-# Speeds (2026-08-29, this build, prefix caching ON):
-#   decode  74 tok/s C1 / 248 C4 / 440 C8 (speedrun.py, ocean-currents prompt)
-#           story-style prompts ~66 C1; C>=4 aggregate varies with MoE routing
-#   prefill 9.6-10.5k tok/s (32k unique prompts, C1-C3)
-# PER-RANK KV BUDGETS (2026-08-29, gpu_worker.py patch): the global 0.94
-# utilization strands ~3 GiB/rank because PP ranks are heterogeneous.
-# VLLM_KV_CACHE_MEMORY_RANK{0,1,2} below set each rank to vLLM's own
-# suggested max minus margin (0.5/0.5/1.0 GiB). Pool: 935,216 -> 1,116,591
-# tokens (+19.4%, 4.26x full-ctx). Validated: 0/160 soak, 253k needle exact
-# with no OOM at the activation peak.
-# 1M CONTEXT VERIFIED: QWEN38_YARN=4.0 QWEN38_MAXLEN=1048576 boots with a
-# 1,220,499-token pool (1.16x) and recalled a needle from a 1,041,971-token
-# prompt exactly (189.6s, ~5.5k tok/s prefill). Opt-in via those env vars.
-# MTP depth sweep 2026-08-29 (QWEN38_SPEC): C1/C8-median/acceptance:
-#   N=1 61/214/79%  N=2 71/267/68%  N=3 75/371/57%  N=4 79/274/50%
-#   N=5 refuses to boot (QSA ring capacity 12 must divide the block size).
-#   Default 3 = best throughput; QWEN38_SPEC=4 gains ~5% single-stream at a
-#   ~26% cost to 8-way aggregate.
-#   TTFT    20k prompt: 5.1s cold -> 1.35s warm (3.8x via prefix cache)
-# NOTE: an experimental 'placeholder verification gate' (falsified hypothesis
-# 0008) lingered in v2_model_runner.py until 08-29 and silently rejected all
-# drafts for requests rescheduled within pp_size sample-steps — at C1 that is
-# every step, capping decode at ~30 tok/s. Removed; do not re-add.
-# PREFIX CACHING: ENABLED as of 2026-08-29 — root cause found and fixed.
-# The old 'duct' loops (14-27%% of requests, upstream #54173's silent variant)
-# were NaN corruption of recurrent state: under PP the persistent gathered
-# block tables are re-gathered by later in-flight steps, and the mamba
-# spec-decode ctx walked them with stale batch rows. Fixed by patches:
-#   block_table.py     round-robin POOL of gathered-table sets (VLLM_BT_POOL=5)
-#   mamba_utils.py     ctx copy kernels index SOURCE tables by req_idx
-#   v2_model_runner.py ctx captures source req-indexed tables
-#   single_type_kv_cache_manager.py  ported unmerged vllm#48375 (eagle drop)
-#   mamba_hybrid.py    vllm#53142 fix (mamba-group block-size divisor)
-#   ple_layer.py       zero-init spec-extension state columns (hardening)
-# Verified 2026-08-29 (clean production build): UUID soak 0/160 loops
-# (~30%% faster rounds than cache-OFF); hit-path 16 convs x 8 turns 0 loops,
-# 47-48/48 planted-code recalls, ~60%% hit rate on conversation traffic;
-# TTFT 20k prompt 5.12s cold -> 1.35s warm (3.8x).
-# Verified 2026-08-27: 262,144 ctx (model native max), 935k KV tokens (3.57x
-# concurrency at full length), ~10,100 tok/s prefill @32k, 260k needle recall in 35.7s,
-# ~69 tok/s decode single / ~434 tok/s at 8 concurrent, MTP ~56% acceptance.
-#
-# WHY PP BEATS DEP ON THIS BOX (measured ~5x prefill):
-#   With data+expert parallel, each token's top-10 of 512 experts are scattered
-#   across all three GPUs, so EVERY one of the 48 layers does an all-to-all over
-#   a PCIe Gen2 x4 link with no working P2P. Under PP each stage owns ALL experts
-#   for its own layers, so expert routing is local and only hidden states cross
-#   stage boundaries -- twice per forward instead of 48 times. PP also shards KV
-#   by layer instead of replicating per rank: 904k KV tokens vs 227k under DEP.
-#
-# Upstream does not support PP+MTP for this model. ./patch holds 8 fixes:
-#   model.py          hyper_connection_mixer is None on non-last ranks; None is not
-#                     an nn.Module so AutoWeightsLoader cannot place its weights.
-#   mtp.py            drafter consulted the parent PP group, so is_first_rank was
-#                     False on the last rank and it demanded intermediate_tensors
-#                     that never arrive. Branch on first-OR-last (per PR #46994).
-#   model_state.py    blanket "PLE requires PP=1" guard -> allow when the PLE
-#                     layers are confined to rank 0 (the only rank with input_ids).
-#   gpu_worker.py     PLE offload rejected PP outright; same containment check.
-#   ple_worker.py     the offload worker is not a pipeline rank but still parsed
-#                     VLLM_PP_LAYER_PARTITION -> "len(partitions)=3 vs pp_size=1".
-#   v2_model_runner.py  skip the PLE connector on ranks with no PleOffloadLayer
-#                     (the worker expects exactly dp_size*tp_size registrations,
-#                     a count that deliberately excludes PP). NOTE: the ACTIVE
-#                     runner is v1/worker/gpu/model_runner.py, not gpu_model_runner.py.
-#   connector.py      PLE offload stages inputs by copying from the runner's LIVE
-#                     buffers, guarded only by a maxsize=1 queue + put_nowait so
-#                     it fails loudly rather than staging stale inputs. That holds
-#                     at PP=1; under PP rank 0 issues the next forward before the
-#                     sender has staged the previous one -> queue.Full kills the
-#                     worker (rank 0 at 0% GPU, ranks 1-2 spinning at 100%). A
-#                     deeper queue or a blocking put would BOTH silently corrupt
-#                     inputs: the sender dequeues before it stages. Fix adds a
-#                     staging-complete event so a launch waits for the previous
-#                     copy to finish. Serialises only the small input copy.
-#   pp_utils.py       PORTED PR #46994: the last rank must relay draft tokens as a
-#   + model_runner.py THIRD broadcast so every rank agrees on the per-step
-#                     collective count. Without it ranks desync and a worker dies
-#                     by signal during decode warmup ("Connection closed by peer").
-#
-# --mamba-ssm-cache-dtype float32 is REQUIRED, not tuning: without it rank 0's GDN
-# state resolves to bfloat16 while rank 2's is float32, so main_kv page requirements
-# differ per stage (816 vs 1584) and the CSA validator rejects the mismatch. float32
-# matches the model's own config (mamba_ssm_dtype). Do NOT "fix" that with a huge
-# --block-size: 1600 unified the pages but produced 3.27MB blocks and a segfault.
-set -u
+# Qwen3.8-Flash-Next-FP8 on 4x CMP 170HX (200 W): PIPELINE PARALLEL 4 + MTP + prefix caching.
+# DEFAULT (since 2026-09-02): partition 12,12,12,12, FULL_AND_PIECEWISE cudagraphs,
+# per-rank KV budgets -> 2,537,837 KV tokens (9.68x full 262k context), seqs 8, MTP 3.
+# Speeds (2026-09-02, warm): decode 89 tok/s C1 (30.0 ms/step) / 254 C4 / 429-433 C8;
+#   prefill 11.1-11.3k tok/s (32k single), 10.6k at 250k and for 8x241k concurrent.
+#   Validated: UUID soak 0/168, hit-path 16x8 turns 0 loops 46/48 recalls, 250k needle
+#   exact, 8 CONCURRENT 241k needles 8/8 exact (1.93M tokens resident).
+# WHY FULL CUDAGRAPHS (the PP4 speed hunt): at C1 a 12-layer stage occupied ~9 ms of
+#   which only a few ms is GPU work -- stages are CPU-dispatch-bound under PIECEWISE
+#   (profiler cross-rank timeline; hops 0.4 ms/step, relay 0.13 ms, wire exonerated).
+#   PIECEWISE PP4 = 59 tok/s (44.2 ms/step) vs PP3 74 (34.8). FULL_AND_PIECEWISE replays
+#   the whole decode step per stage: 30.0 ms -> 89 tok/s. MTP N=4 only bought +6% C1 for
+#   -12% C8; 13,13,13,9 is pointless (drafter forwards cost <1 ms).
+# FULL GRAPHS x BLOCK-TABLE POOL: patch 0009's rotating gathered-table pool (VLLM_BT_POOL)
+#   CORRUPTS under full graphs (10/144 'duct' loops): a captured graph bakes ONE pool
+#   slot's pointer, so 5/6 steps read stale tables. Pool is forced to 1 when CG=FULL*
+#   (0010 alone is the proven-sufficient fix; ablation 0/160). Do not raise it.
+# 4-CARD TOPOLOGY: bus 01/21/41/42, PCIe Gen2 x4 each, no P2P, 0.78 GB/s host-bounce
+#   for every pair. PLE n-gram table stays on CPU (VLLM_PLE_CPU_OFFLOAD=1, ~2% of a
+#   step): an attention-less rank cannot host it (cache layout needs a QSA tensor slot).
+# Per-rank sizing (measured): 12L 34.0-34.3 GiB weights+overhead, 12L+drafter 37.9;
+#   humming repack needs ~1.6 GiB transient scratch at load. Over-committing a rank
+#   faults (IMA) instead of OOM and wedges GSP firmware -> reboot.
+# 3-CARD RECIPES still supported (budgets keyed by partition below):
+#   QWEN38_PARTITION=16,17,15 QWEN38_GPUS=0,1,2 ./run-pp3-mtp.sh   (1,359,009 tokens, 70 C1)
+#   QWEN38_PARTITION=16,16,16 QWEN38_GPUS=0,1,2 ./run-pp3-mtp.sh   (1,116,591 tokens, 74 C1)
+#   (PP3 numbers above were measured with PIECEWISE; FULL_AND_PIECEWISE should help there too.)
+# 1M CONTEXT (verified on PP3): QWEN38_YARN=4.0 QWEN38_MAXLEN=1048576 -> 1,041,971-token
+#   needle exact. Opt-in via those env vars.
+# MTP depth (QWEN38_SPEC): PP3 sweep C1/C8/acc N=1 61/214/79% N=2 71/267/68% N=3 75/371/57%
+#   N=4 79/274/50%; N=5 refuses (QSA ring divisibility; upstream #54912 lifts it). PP4: N=4 63/327.
+# HISTORY: prefix-caching 'duct' loops were NaN corruption of recurrent state under PP
+#   (stale gathered block tables walked by the deferred mamba spec-decode ctx); fixed by
+#   patch 0010 (ctx captures SOURCE req-indexed tables; kernels index by req_idx). A
+#   falsified 'placeholder verification gate' (0008) once capped C1 at ~30 tok/s; removed.
+# Knobs: QWEN38_PARTITION QWEN38_GPUS QWEN38_KV0..3 QWEN38_CG QWEN38_BT_POOL QWEN38_SPEC
+#   QWEN38_SEQS QWEN38_MAXLEN QWEN38_YARN QWEN38_EXTRA_ARGS (e.g. --max-num-batched-tokens 8192)
+#   Profiling: QWEN38_EXTRA_ARGS='--profiler-config {"profiler":"torch","torch_profiler_dir":"/tmp/profiles"}'
+#   then POST /start_profile, /stop_profile (CPU-side events only on these cards).
+
 
 NAME=${QWEN38_NAME:-qwen38-pp}
 PORT=${QWEN38_PORT:-8001}
 IMG=${QWEN38_IMG:-vllm/vllm-openai:qwen38-flash-next}
 HFCACHE=${QWEN38_HF:-/home/r/.cache/huggingface}
 SNAPSHOT=${QWEN38_SNAPSHOT:-bcd9f01ddc9cff2316eb84281bebcd5b058bddce}
-PARTITION=${QWEN38_PARTITION:-16,16,16}
+PARTITION=${QWEN38_PARTITION:-12,12,12,12}
+PP=$(echo "$PARTITION" | tr "," "\n" | wc -l)   # ranks = partition entries
+GPU_ORDER=${QWEN38_GPUS:-all}                     # e.g. 0,1,2,3 to pin rank->device
 UTIL=${QWEN38_UTIL:-0.94}
 MAXLEN=${QWEN38_MAXLEN:-262144}
 # QWEN38_YARN=<factor> extends context past the native 262,144 via Qwen's own
@@ -105,7 +60,23 @@ MAXLEN=${QWEN38_MAXLEN:-262144}
 YARN=${QWEN38_YARN:-}
 SEQS=${QWEN38_SEQS:-8}
 SPEC_N=${QWEN38_SPEC:-3}
-PATCHDIR=${QWEN38_PATCH:-./patched}   # produce with serve/make-patched-tree.sh
+EXTRA_ARGS=${QWEN38_EXTRA_ARGS:-}
+CG=${QWEN38_CG:-FULL_AND_PIECEWISE}
+# gathered-table pool (patch 0009) rotates buffers per step; a FULL cudagraph bakes
+# one slot's pointer at capture -> stale tables -> state corruption. Pool=1 under FULL*.
+BT_POOL=${QWEN38_BT_POOL:-$( [[ $CG == FULL* ]] && echo 1 || echo $((PP+2)) )}   # e.g. --profiler-config ... or --max-num-batched-tokens 8192
+
+# Per-rank KV budgets (patch 0014) are measured per PARTITION; a partition must never
+# inherit another's numbers (over-committing a rank faults at load and wedges GSP firmware).
+case "$PARTITION" in
+  12,12,12,12) D0=28089402880; D1=30123884544; D2=30123884544; D3=24216759808 ;;  # 4 cards: pool 2,537,837 (9.68x)
+  16,17,15)    D0=18253611008; D1=16106127360; D2=16642998272; D3= ;;             # 3 cards: pool 1,359,009 (5.18x)
+  16,16,16)    D0=17212851712; D1=19231211520; D2=13323913216; D3= ;;             # 3 cards throughput-first: 1,116,591
+  *)           D0=; D1=; D2=; D3= ;;                                              # unknown: discovery run (util 0.94)
+esac
+KV0=${QWEN38_KV0:-$D0}; KV1=${QWEN38_KV1:-$D1}; KV2=${QWEN38_KV2:-$D2}; KV3=${QWEN38_KV3:-$D3}
+KV_ENV="${KV0:+-e VLLM_KV_CACHE_MEMORY_RANK0=$KV0} ${KV1:+-e VLLM_KV_CACHE_MEMORY_RANK1=$KV1} ${KV2:+-e VLLM_KV_CACHE_MEMORY_RANK2=$KV2} ${KV3:+-e VLLM_KV_CACHE_MEMORY_RANK3=$KV3}"
+PATCHDIR=${QWEN38_PATCH:-/home/r/qwen38-run/patch}
 
 V=/usr/local/lib/python3.12/dist-packages/vllm
 MODEL="/hf/hub/models--Qwen--Qwen3.8-Flash-Next-FP8/snapshots/$SNAPSHOT"
@@ -124,12 +95,11 @@ fi
 docker stop -t 60 "$NAME" >/dev/null 2>&1
 docker rm "$NAME" >/dev/null 2>&1
 
-docker run -d --name "$NAME" --gpus all --ipc=host --shm-size=32g \
+docker run -d --name "$NAME" --gpus "$([ "$GPU_ORDER" = all ] && echo all || echo "\"device=$GPU_ORDER\"")" --ipc=host --shm-size=32g \
   -e HF_HOME=/hf \
   -e VLLM_PLE_CPU_OFFLOAD=1 -e VLLM_USE_FLASHINFER_SAMPLER=0 \
-  -e VLLM_ENGINE_READY_TIMEOUT_S=5400 -e VLLM_BT_POOL=5 \
-  -e VLLM_KV_CACHE_MEMORY_RANK0=17212851712 -e VLLM_KV_CACHE_MEMORY_RANK1=19231211520 \
-  -e VLLM_KV_CACHE_MEMORY_RANK2=13324086784 \
+  -e VLLM_ENGINE_READY_TIMEOUT_S=5400 -e VLLM_BT_POOL=$BT_POOL \
+  $KV_ENV \
   ${YARN:+-e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1} \
   -e NCCL_P2P_DISABLE=1 -e NCCL_IB_DISABLE=1 \
   -e VLLM_PP_LAYER_PARTITION="$PARTITION" \
@@ -151,15 +121,16 @@ docker run -d --name "$NAME" --gpus all --ipc=host --shm-size=32g \
   -v "$PATCHDIR/fused_recurrent.py":$V/third_party/flash_linear_attention/ops/fused_recurrent.py:ro \
   -p "$PORT":8000 \
   "$IMG" "$MODEL" --served-model-name qwen38 \
-  --pipeline-parallel-size 3 --moe-backend humming \
+  --pipeline-parallel-size "$PP" --moe-backend humming \
   --enable-prefix-caching \
   --mamba-ssm-cache-dtype float32 \
   --gpu-memory-utilization "$UTIL" --max-model-len "$MAXLEN" --max-num-seqs "$SEQS" \
   ${YARN:+--hf-overrides "{\"text_config\":{\"rope_parameters\":{\"mrope_interleaved\":true,\"mrope_section\":[11,11,10],\"rope_type\":\"yarn\",\"rope_theta\":10000000,\"partial_rotary_factor\":0.25,\"factor\":$YARN,\"original_max_position_embeddings\":262144}}}"} \
-  -cc.cudagraph_mode=PIECEWISE --no-enable-flashinfer-autotune \
+  -cc.cudagraph_mode=$CG --no-enable-flashinfer-autotune \
+  $EXTRA_ARGS \
   --speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":$SPEC_N}" \
   --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 \
   >/dev/null
 
-echo "launched $NAME on :$PORT  (PP3 $PARTITION, maxlen $MAXLEN, seqs $SEQS, mtp $SPEC_N)"
+echo "launched $NAME on :$PORT  (PP$PP $PARTITION, cudagraph $CG pool $BT_POOL, maxlen $MAXLEN, seqs $SEQS, mtp $SPEC_N)"
 echo "startup ~5 min. follow:  docker logs -f $NAME"
