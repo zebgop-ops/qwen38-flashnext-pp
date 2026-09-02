@@ -80,6 +80,12 @@ has mamba cache owners but no main_kv tensor slots" — the GDN/PLE state pages
 are carved inside the same-stage QSA tensors, and rank 0 cannot also fit a QSA
 layer next to the 50 GiB table. The CPU offload costs ~2% of a step; it stays.
 
+**Host CPU governor.** With stages dispatch-bound, the host's `powersave`
+governor (amd-pstate-epp, `balance_performance`) was a suspect. A/B on the
+same running server: `performance` took C1 from 84.9 to 89.2 tok/s (29.9 →
+29.3 ms/step) and tightened the run spread (83.8–90.4 → 87.6–91.8); C8 429 →
+443. A 2–5% effect — the busy core was already boosting under load — but free.
+
 **Cold numbers lie.** Right after boot the first 32k prefill read 5.4k tok/s
 (JIT) and the first C8 run 216; warm they are 11.2k and 372+. Warm up before
 judging any configuration.
