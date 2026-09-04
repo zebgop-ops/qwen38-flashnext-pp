@@ -79,7 +79,14 @@ KV_ENV="${KV0:+-e VLLM_KV_CACHE_MEMORY_RANK0=$KV0} ${KV1:+-e VLLM_KV_CACHE_MEMOR
 PATCHDIR=${QWEN38_PATCH:-/home/r/qwen38-run/patch}
 
 V=/usr/local/lib/python3.12/dist-packages/vllm
-MODEL="/hf/hub/models--Qwen--Qwen3.8-Flash-Next-FP8/snapshots/$SNAPSHOT"
+# QWEN38_REPO=orcarouter/Qwen3.8-Flash-Next-Uncensored-FP8 serves a sibling checkpoint from the
+# same HF cache (must be the official block-FP8 layout; snapshot = the one hf downloaded).
+REPO=${QWEN38_REPO:-Qwen/Qwen3.8-Flash-Next-FP8}
+if [ "$REPO" != "Qwen/Qwen3.8-Flash-Next-FP8" ]; then
+  SNAPSHOT=$(ls -1 "$HFCACHE/hub/models--${REPO//\//--}/snapshots" 2>/dev/null | head -1)
+  [ -n "$SNAPSHOT" ] || { echo "no local snapshot for $REPO in $HFCACHE (run download-uncensored-fp8.sh)"; exit 1; }
+fi
+MODEL="/hf/hub/models--${REPO//\//--}/snapshots/$SNAPSHOT"
 
 for f in model.py mtp.py model_state.py v2_model_runner.py pp_utils.py \
          gpu_worker.py ple_worker.py connector.py \
@@ -88,9 +95,11 @@ for f in model.py mtp.py model_state.py v2_model_runner.py pp_utils.py \
   [ -f "$PATCHDIR/$f" ] || { echo "missing patch $PATCHDIR/$f" >&2; exit 1; }
 done
 
-if docker inspect -f '{{.State.Running}}' dsv4-a100 2>/dev/null | grep -q true; then
-  echo "dsv4-a100 is running and holds the GPUs. Stop it first." >&2; exit 1
-fi
+for c in dsv4-a100 glm53flash-pp glm53nvfp4-pp; do
+  if docker inspect -f '{{.State.Running}}' $c 2>/dev/null | grep -q true; then
+    echo "$c is running and holds the GPUs. Stop it first." >&2; exit 1
+  fi
+done
 
 docker stop -t 60 "$NAME" >/dev/null 2>&1
 docker rm "$NAME" >/dev/null 2>&1
@@ -120,7 +129,7 @@ docker run -d --name "$NAME" --gpus "$([ "$GPU_ORDER" = all ] && echo all || ech
   -v "$PATCHDIR/ple_layer.py":$V/models/qwen3_8_flash_next/nvidia/ple_layer.py:ro \
   -v "$PATCHDIR/fused_recurrent.py":$V/third_party/flash_linear_attention/ops/fused_recurrent.py:ro \
   -p "$PORT":8000 \
-  "$IMG" "$MODEL" --served-model-name qwen38 \
+  "$IMG" "$MODEL" --served-model-name "${QWEN38_SERVED:-qwen38}" \
   --pipeline-parallel-size "$PP" --moe-backend humming \
   --enable-prefix-caching \
   --mamba-ssm-cache-dtype float32 \
