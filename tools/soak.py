@@ -1,6 +1,7 @@
 """Sustained agentic-style soak at concurrency 8, with a validated detector."""
 import json, time, urllib.request, concurrent.futures as cf, uuid, sys
-sys.path.insert(0, "/tmp/claude-1000/-home-r-claude/f2d56dec-4023-4259-8062-05d76e57a901/scratchpad")
+import os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # detect.py lives beside this file
 from detect import find_loop
 
 URL = "http://localhost:8001/v1/chat/completions"
