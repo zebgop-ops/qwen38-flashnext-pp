@@ -130,3 +130,17 @@ informed this work.
 ## License
 
 Apache-2.0 (patches and ported files contain code derived from vLLM).
+
+## Quality on this box, measured against the other servers
+
+`tools/quality.py` + `tools/qtable.py` score every model here on identical inputs and the same
+1000 MMLU questions (cloze-scored, no chat template; perplexity reported as bits per byte, which
+is comparable across tokenizers). Full table and method:
+[dsv41reap-pp/CROSS-MODEL.md](https://github.com/zebgop-ops/dsv41reap-pp/blob/main/CROSS-MODEL.md).
+
+| model | wikitext bits/byte | code bits/byte | MMLU (1000 q) |
+|---|---|---|---|
+| Qwen3.8-Flash-Next FP8 | 0.4394 | 0.0805 | 89.0% |
+| GLM-5.3-Flash W4A16 | 0.3884 | 0.1428 | 85.6% |
+| DeepSeek-V4.1-Flash | 0.3275 | 0.1044 | 84.4% |
+| DeepSeek-V4.1-Flash REAP-272E | 0.4091 | 0.1046 | 76.7% |
