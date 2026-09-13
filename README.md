@@ -138,9 +138,12 @@ Apache-2.0 (patches and ported files contain code derived from vLLM).
 is comparable across tokenizers). Full table and method:
 [dsv41reap-pp/CROSS-MODEL.md](https://github.com/zebgop-ops/dsv41reap-pp/blob/main/CROSS-MODEL.md).
 
-| model | wikitext bits/byte | code bits/byte | MMLU (1000 q) |
-|---|---|---|---|
-| Qwen3.8-Flash-Next FP8 | 0.4394 | 0.0805 | 89.0% |
-| GLM-5.3-Flash W4A16 | 0.3884 | 0.1428 | 85.6% |
-| DeepSeek-V4.1-Flash | 0.3275 | 0.1044 | 84.4% |
-| DeepSeek-V4.1-Flash REAP-272E | 0.4091 | 0.1046 | 76.7% |
+| model | MMLU (1000 q) | HumanEval+ | MBPP+ | wikitext bits/byte |
+|---|---|---|---|---|
+| Qwen3.8-Flash-Next FP8 | 89.0% | 94.5% | 83.1% | 0.4394 |
+| GLM-5.3-Flash W4A16 | 85.6% | 92.7% | 83.3% | 0.3884 |
+| DeepSeek-V4.1-Flash | 84.4% | 93.9% | 84.9% | 0.3275 |
+| DeepSeek-V4.1-Flash REAP-272E | 76.7% | 93.9% | 83.3% | 0.4091 |
+
+HumanEval+ / MBPP+ are executed pass@1 (542 tasks per model, sandboxed). All four are within
+2 points on code with no pair statistically separable; MMLU is where they differ.
