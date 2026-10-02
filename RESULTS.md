@@ -90,6 +90,49 @@ same running server: `performance` took C1 from 84.9 to 89.2 tok/s (29.9 →
 (JIT) and the first C8 run 216; warm they are 11.2k and 372+. Warm up before
 judging any configuration.
 
+## Update 2026-10-02: structured outputs (JSON mode) under PP + MTP — patch 0016
+
+`response_format` requests failed with HTTP 500 (`scheduler.py: Unexpected: grammar
+rejected tokens [4 ids]`) whenever requests overlapped; 242 kills in 24 h of real
+traffic. PP4, MTP N=3, xgrammar, `enable_thinking: false` unless noted.
+
+| | before | with 0016 |
+|---|---|---|
+| `json_object`, 1-way | 0/8 fail | 0/10 fail, keys intact |
+| `json_object`, 4-way | **10/12 fail** | 0/24 (short) + 0/16 (700-token) |
+| `json_object`, 8-way | — | 0/32 + 0/16 |
+| strict `json_schema`, 1 / 8-way short, 4 / 8-way long | — | 16/16, 64/64, 16/16, 16/16 |
+| thinking ON + `json_schema`, 4-way | — | 16/16 correct and conforming |
+| plain decode C1 / C8 | 89 / 429–443 | 89.9 / 442 (no regression) |
+
+**Mechanism.** With spec decode, the scheduler needs each request's draft tokens to
+build the grammar mask for every speculative position, and asks the sampling worker
+for them (`take_draft_token_ids`). The worker's `DraftTokensHandler` holds one slot:
+the last sampled batch. Without PP a request's previous step *is* the last sampled
+batch. Under PP a request is rescheduled `pp_size` steps later and other microbatches
+are sampled in between, so the slot holds someone else's drafts. The scheduler skips
+them, the request's drafts stay `-1` placeholders, and `grammar_bitmask` then masks
+position 0 correctly, leaves the draft positions unconstrained, and builds the
+bonus-token mask from the *un-advanced* grammar state. When all drafts are accepted
+the bonus token is sampled under a mask that is three tokens stale — which is why
+every rejected batch had its invalid token last (`, \n  }`, `\n  ""title`).
+Concurrency 1 never fails: nothing else is sampled in between.
+
+**Fix.** Drafts kept per request on the worker; fetched on the engine's
+non-deferred path too (reachable under PP when the batch queue is shallower than
+`pp_size`); pruned when a request is removed.
+
+**A regression I shipped and caught on the way.** The first version pruned with
+"tombstones" (skip this id at the next merge). But the runner's `add_requests` calls
+`_remove_request` for every *new* request before adding it, so a request could be
+tombstoned before producing anything, and its first drafts were then dropped. That
+moved the failure to the first decode step of sequential requests: strict schema
+died right after `{` (0/16 at 1-way) and `json_object` returned HTTP 200 with the
+first key silently replaced by `""`. `json_object` cannot detect a stale mask — any
+string is a legal key — so the passing 500-count test proved nothing; the strict
+`json_schema` probe (`tools/json_schema_probe.py`) is the sharp detector and is now
+part of validation. Pruning now merges pending batches first, then drops the id.
+
 ## Decode throughput (tok/s)
 
 Median of 3+ runs, 200–300 generated tokens, unique (cache-defeating)

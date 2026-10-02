@@ -78,6 +78,7 @@ Correctness — the prefix-caching corruption and its relatives:
 | 0013 | Zero-init the PLE spec-extension state columns on prefill (uninit-VRAM NaN hardening) |
 | 0014 | Per-rank KV budgets via `VLLM_KV_CACHE_MEMORY_RANK<i>` — +19.4% KV pool on heterogeneous PP ranks; unlocks 1M context (see RESULTS.md) |
 | 0015 | CSA layout: normalize mamba specs from an attention-less PP stage before the "one spec" check (needed by any `2,…` partition; the PLE-in-VRAM attempt still dies at the next planner check — see RESULTS.md) |
+| **0016** | **Structured outputs (JSON mode / json_schema) under PP + spec decode**: the worker kept only the latest microbatch's drafts for grammar validation, so interleaved requests got placeholder drafts and unconstrained speculative positions (HTTP 500 "grammar rejected tokens" for most requests at concurrency > 1). Drafts are now kept per request; the engine also fetches them on the non-deferred path. The handler and engine-core hunks apply to upstream `main` unchanged |
 
 Also shipped: `ported-files/` (the vllm#46994 MTP-under-PP relay port —
 `pp_utils.py` + the V2 runner — and vllm#53877's fp32 GDN beta), which are

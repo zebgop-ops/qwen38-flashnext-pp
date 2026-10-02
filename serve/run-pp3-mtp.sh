@@ -30,6 +30,13 @@
 #   needle exact. Opt-in via those env vars.
 # MTP depth (QWEN38_SPEC): PP3 sweep C1/C8/acc N=1 61/214/79% N=2 71/267/68% N=3 75/371/57%
 #   N=4 79/274/50%; N=5 refuses (QSA ring divisibility; upstream #54912 lifts it). PP4: N=4 63/327.
+# STRUCTURED OUTPUTS (JSON mode) x PP x MTP (2026-10-02): response_format json_object died with
+#   HTTP 500 for most requests at concurrency >1 ("grammar rejected tokens", scheduler.py:1924).
+#   The worker kept only the LATEST microbatch's drafts for grammar validation; under PP a request
+#   is rescheduled pp_size steps later with other microbatches sampled in between, so the scheduler
+#   got another request's drafts, left this one's as -1 placeholders, and sent its speculative
+#   positions out unconstrained. Fix: spec_decode_utils.py (drafts kept per request),
+#   engine_core.py (drafts also fetched on the non-deferred path), v2_model_runner.py (prune).
 # HISTORY: prefix-caching 'duct' loops were NaN corruption of recurrent state under PP
 #   (stale gathered block tables walked by the deferred mamba spec-decode ctx); fixed by
 #   patch 0010 (ctx captures SOURCE req-indexed tables; kernels index by req_idx). A
@@ -91,7 +98,8 @@ MODEL="/hf/hub/models--${REPO//\//--}/snapshots/$SNAPSHOT"
 for f in model.py mtp.py model_state.py v2_model_runner.py pp_utils.py \
          gpu_worker.py ple_worker.py connector.py \
          block_table.py mamba_utils.py single_type_kv_cache_manager.py \
-         mamba_hybrid.py ple_layer.py fused_recurrent.py; do
+         mamba_hybrid.py ple_layer.py fused_recurrent.py \
+         spec_decode_utils.py engine_core.py; do
   [ -f "$PATCHDIR/$f" ] || { echo "missing patch $PATCHDIR/$f" >&2; exit 1; }
 done
 
@@ -128,6 +136,8 @@ docker run -d --name "$NAME" --gpus "$([ "$GPU_ORDER" = all ] && echo all || ech
   -v "$PATCHDIR/mamba_hybrid.py":$V/v1/worker/gpu/model_states/mamba_hybrid.py:ro \
   -v "$PATCHDIR/ple_layer.py":$V/models/qwen3_8_flash_next/nvidia/ple_layer.py:ro \
   -v "$PATCHDIR/fused_recurrent.py":$V/third_party/flash_linear_attention/ops/fused_recurrent.py:ro \
+  -v "$PATCHDIR/spec_decode_utils.py":$V/v1/worker/gpu/spec_decode/utils.py:ro \
+  -v "$PATCHDIR/engine_core.py":$V/v1/engine/core.py:ro \
   -p "$PORT":8000 \
   "$IMG" "$MODEL" --served-model-name "${QWEN38_SERVED:-qwen38}" \
   --pipeline-parallel-size "$PP" --moe-backend humming \

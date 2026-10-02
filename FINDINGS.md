@@ -453,3 +453,26 @@ writes through freed/reallocated block ids, exactly the Addendum 16 bug by a
 different road. Pool=1 (0010 alone, proven sufficient in Addendum 19): 0/168
 soak, hit-path 0 loops, needles exact. Rule: any rotating per-step buffer that
 a captured op reads is a full-graph hazard; persistent buffers only.
+
+
+## Addendum 23: structured outputs + spec decode + PP — single-slot draft handoff (patch 0016)
+
+Symptom, mechanism, fix and validation are in RESULTS.md (2026-10-02 update). Notes
+for anyone porting or upstreaming:
+
+- The defect is in generic code (`vllm/v1/worker/gpu/spec_decode/utils.py`,
+  `vllm/v1/engine/core.py`), not in the model. Upstream `main` has the same single-slot
+  handler; the 0016 hunks for those two files apply to it unchanged. It only bites when
+  a request's previous sample is not the most recent one on the sampling rank, i.e.
+  V2 runner + pipeline parallel + async scheduling + spec decode + a grammar.
+- Signature in the log: rejected batches of exactly `1 + num_speculative_tokens` ids
+  with the invalid one LAST, legal under the grammar state a few tokens earlier.
+- xgrammar's "matcher has terminated after accepting the stop token" warning is
+  benign: it is draft validation running past end-of-output.
+- Testing lesson: a permissive grammar (`json_object`) hides stale masks as odd-but-
+  legal output (`{"": "Paris", ...}`). Use a strict schema with fixed keys, and check
+  content, not only HTTP status. Concurrency 1 and concurrency N exercise different
+  paths; test both.
+- `add_requests` calls `_remove_request` on ids that have never existed. Any
+  per-request cleanup hooked there must be a no-op for unknown ids and must not
+  leave state that affects the request's future.
